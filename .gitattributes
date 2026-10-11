@@ -1,0 +1,3 @@
+# Keep CRLF for the Windows launcher, LF for shell scripts
+*.bat -text
+*.sh text eol=lf

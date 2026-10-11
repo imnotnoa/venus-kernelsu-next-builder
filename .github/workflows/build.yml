@@ -1,0 +1,237 @@
+name: Build venus kernel with KernelSU Next
+
+# Builds the exact kernel your ROM ships for the Xiaomi Mi 11 (venus), from the
+# ROM's own kernel source at the commit in your `uname -r`, with KernelSU Next
+# compiled in. The result is a raw arm64 "Image" that the flash scripts in
+# flash/ put into your ROM's stock boot.img.
+#
+# The build refuses to finish unless the version string of the new kernel is
+# exactly the `uname -r` you entered. A kernel from a different commit cannot
+# load your ROM's vendor modules (display, touch, audio) and will not boot.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: 'Your kernel version: output of "adb shell uname -r", e.g. 5.4.302-qgki-g082d73c24f7a'
+        required: true
+      kernel_repo:
+        description: Your ROM's kernel source on GitHub (owner/name)
+        default: Evolution-X-Devices/kernel_xiaomi_venus
+      kernel_branch:
+        description: Branch of that source that contains your kernel commit
+        default: cnb
+      ksu_ref:
+        description: KernelSU Next tag for non-GKI kernels (must be a -legacy tag)
+        default: v3.4.0-legacy
+      hook_mode:
+        description: KernelSU hook. kprobes works on venus; syscall_table boots but is not detected (CFI)
+        type: choice
+        options:
+          - kprobes
+          - syscall_table
+        default: kprobes
+      defconfig:
+        description: Defconfig, then config fragments (paths under arch/arm64/configs)
+        default: vendor/lahaina-qgki_defconfig vendor/debugfs.config vendor/xiaomi_QGKI.config vendor/venus_QGKI.config
+      clang_version:
+        description: AOSP clang prebuilt your ROM is built with
+        default: clang-r563880c
+      clang_ref:
+        description: AOSP ref that contains that clang prebuilt
+        default: refs/tags/android-17.0.0_r1
+      vendor_boot_url:
+        description: Optional direct link to your ROM build's vendor_boot.img, for the module ABI check
+        default: ''
+      publish:
+        description: 'Where the kernel goes: a release in your fork, only a workflow artifact, or nowhere (test build)'
+        type: choice
+        options:
+          - release
+          - artifact
+          - none
+        default: release
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      OUT: ${{ github.workspace }}/out
+    steps:
+      - name: Check inputs
+        env:
+          INPUT_VERSION: ${{ inputs.kernel_version }}
+        run: |
+          KERNEL_VERSION=$(printf '%s' "$INPUT_VERSION" | tr -d '[:space:]')
+          if ! printf '%s' "$KERNEL_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::kernel_version '$KERNEL_VERSION' does not look like a uname -r (expected e.g. 5.4.302-qgki-g082d73c24f7a)"
+            exit 1
+          fi
+          # setlocalversion appends -g<commit> for git trees. That commit is
+          # what we build. No commit in the version: build the branch head and
+          # rely on the version check at the end.
+          COMMIT=$(printf '%s' "$KERNEL_VERSION" | sed -nE 's/.*-g([0-9a-f]{7,40})$/\1/p')
+          {
+            echo "KERNEL_VERSION=$KERNEL_VERSION"
+            echo "COMMIT=$COMMIT"
+          } >> "$GITHUB_ENV"
+          echo "Target kernel: $KERNEL_VERSION"
+          echo "Commit:        ${COMMIT:-none in version string, using branch ${{ inputs.kernel_branch }}}"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q bc bison flex libssl-dev libelf-dev cpio python3 zip
+
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+        with:
+          path: builder
+
+      - name: Clone kernel source
+        run: |
+          git clone --filter=blob:none --no-checkout --branch "${{ inputs.kernel_branch }}" \
+            "https://github.com/${{ inputs.kernel_repo }}" kernel
+          if [ -n "$COMMIT" ]; then
+            if ! git -C kernel cat-file -e "${COMMIT}^{commit}" 2>/dev/null; then
+              # Not on that branch: the commit may live on another branch.
+              git -C kernel fetch --filter=blob:none origin '+refs/heads/*:refs/remotes/origin/*'
+            fi
+            if ! git -C kernel cat-file -e "${COMMIT}^{commit}" 2>/dev/null; then
+              echo "::error::Commit $COMMIT is not in ${{ inputs.kernel_repo }}. This is not the kernel source your ROM was built from."
+              exit 1
+            fi
+            git -C kernel checkout --quiet "$COMMIT"
+          else
+            git -C kernel checkout --quiet "${{ inputs.kernel_branch }}"
+          fi
+          git -C kernel log -1 --format='Building %H (%cd) %s'
+
+      - name: Download AOSP clang
+        run: |
+          mkdir clang
+          curl -fsSL --retry 3 \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/${{ inputs.clang_ref }}/${{ inputs.clang_version }}.tar.gz" \
+            | tar -xz -C clang
+          echo "${{ github.workspace }}/clang/bin" >> "$GITHUB_PATH"
+
+      - name: Add KernelSU Next
+        working-directory: kernel
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${{ inputs.ksu_ref }}/kernel/setup.sh" \
+            | bash -s "${{ inputs.ksu_ref }}"
+          sh ../builder/kernel/ksu-compat.sh
+          # Keep `uname -r` identical to the stock kernel. Without this, the
+          # KernelSU changes make setlocalversion append "-dirty".
+          if [ -n "$COMMIT" ]; then echo "-g${COMMIT}" > .scmversion; else : > .scmversion; fi
+
+      - name: Configure
+        working-directory: kernel
+        run: |
+          MAKE_ARGS=(O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 TARGET_PRODUCT=venus)
+          case "${{ inputs.hook_mode }}" in
+            syscall_table) HOOK=CONFIG_KSU_SYSCALL_TABLE_HOOK; OTHER=CONFIG_KSU_KPROBES_HOOK ;;
+            kprobes)       HOOK=CONFIG_KSU_KPROBES_HOOK;       OTHER=CONFIG_KSU_SYSCALL_TABLE_HOOK ;;
+          esac
+          printf '%s=y\n# %s is not set\n' "$HOOK" "$OTHER" > "$RUNNER_TEMP/ksu-hook.config"
+
+          read -r -a CONFIGS <<< "${{ inputs.defconfig }}"
+          DEFCONFIG=${CONFIGS[0]}
+          FRAGMENTS=()
+          for f in "${CONFIGS[@]:1}"; do
+            [ -f "arch/arm64/configs/$f" ] || { echo "::error::Config fragment arch/arm64/configs/$f not found"; exit 1; }
+            FRAGMENTS+=("arch/arm64/configs/$f")
+          done
+          make "${MAKE_ARGS[@]}" "$DEFCONFIG"
+          scripts/kconfig/merge_config.sh -m -O "$OUT" "$OUT/.config" \
+            "${FRAGMENTS[@]}" \
+            ../builder/kernel/kernelsu.config \
+            "$RUNNER_TEMP/ksu-hook.config"
+          make "${MAKE_ARGS[@]}" olddefconfig
+          for opt in CONFIG_KSU=y "$HOOK=y"; do
+            grep -qx "$opt" "$OUT/.config" || { echo "::error::$opt is missing from .config (does this kernel support it?)"; exit 1; }
+          done
+          if [ "${{ inputs.hook_mode }}" = kprobes ]; then
+            grep -qx CONFIG_KPROBES=y "$OUT/.config" || { echo "::error::kprobes hook needs CONFIG_KPROBES=y"; exit 1; }
+          fi
+
+      - name: Build
+        working-directory: kernel
+        run: |
+          status=0
+          make O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 TARGET_PRODUCT=venus -j"$(nproc)" Image modules \
+            > "$OUT/build.log" 2>&1 || status=$?
+          grep -E "^-- (KernelSU|KSU)|error:" "$OUT/build.log" || true
+          if [ "$status" -ne 0 ]; then tail -n 100 "$OUT/build.log"; exit "$status"; fi
+
+      - name: Check kernel version
+        run: |
+          BANNER=$(strings "$OUT/arch/arm64/boot/Image" | grep -m1 "^Linux version [0-9]")
+          BUILT=$(printf '%s' "$BANNER" | awk '{print $3}')
+          echo "$BANNER"
+          if [ "$BUILT" != "$KERNEL_VERSION" ]; then
+            echo "::error::Built kernel is $BUILT, your phone runs $KERNEL_VERSION. Do not flash this. Check kernel_repo, kernel_branch and defconfig."
+            exit 1
+          fi
+          strings "$OUT/arch/arm64/boot/Image" | grep -q KernelSU || { echo "::error::KernelSU not found in the Image"; exit 1; }
+          echo "Version matches: $BUILT"
+
+      - name: Check vendor module ABI
+        if: inputs.vendor_boot_url != ''
+        run: |
+          # Some ROM servers block GitHub's runners. The test boot is the real
+          # check, so a failed download only warns. A real CRC mismatch fails.
+          if ! curl -fsSL --retry 3 -o vendor_boot.img "${{ inputs.vendor_boot_url }}"; then
+            echo "::warning::Could not download vendor_boot.img; skipping the module ABI check."
+            exit 0
+          fi
+          python3 builder/tools/check_modversions.py \
+            --symvers "$OUT/Module.symvers" --vendor-boot vendor_boot.img
+
+      - name: Package
+        run: |
+          mkdir dist
+          cp "$OUT/arch/arm64/boot/Image" dist/Image
+          cp "$OUT/Module.symvers" dist/Module.symvers
+          cp "$OUT/.config" dist/kernel.config
+          KSU_VERSION=$(grep -oE "KernelSU-Next version: [0-9]+" "$OUT/build.log" | head -n1 | grep -oE "[0-9]+$" || true)
+          {
+            echo "kernel_version=$KERNEL_VERSION"
+            echo "kernel_repo=${{ inputs.kernel_repo }}"
+            echo "kernel_commit=$(git -C kernel rev-parse HEAD)"
+            echo "ksu_ref=${{ inputs.ksu_ref }}"
+            echo "ksu_version=${KSU_VERSION}"
+            echo "hook_mode=${{ inputs.hook_mode }}"
+            echo "defconfig=${{ inputs.defconfig }}"
+            echo "clang=${{ inputs.clang_version }} (${{ inputs.clang_ref }})"
+            echo "linux_banner=$(strings dist/Image | grep -m1 '^Linux version [0-9]')"
+          } > dist/build-info.txt
+          (cd dist && sha256sum Image > Image.sha256)
+          cat dist/build-info.txt
+          echo "RELEASE_TAG=venus-${KERNEL_VERSION}-ksun-${{ inputs.ksu_ref }}-${{ inputs.hook_mode }}-$(date -u +%Y%m%d%H%M)" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        if: inputs.publish != 'none'
+        uses: actions/upload-artifact@v4
+        with:
+          name: venus-${{ env.KERNEL_VERSION }}-ksun
+          path: dist/
+
+      - name: Publish release
+        if: inputs.publish == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$RELEASE_TAG" dist/* \
+            --repo "${{ github.repository }}" \
+            --title "venus ${KERNEL_VERSION} + KernelSU Next ${{ inputs.ksu_ref }} (${{ inputs.hook_mode }})" \
+            --notes-file dist/build-info.txt
