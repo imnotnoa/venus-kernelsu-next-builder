@@ -1,5 +1,16 @@
 # venus-kernelsu-next-builder
 
+> [!IMPORTANT]
+> **Evolution X 12.4 and newer: you don't need to build a kernel.**
+>
+> Starting with Evolution X 12.4 (November 2026), the Evolution X kernel for venus has **KernelSU Next built in** (latest `legacy` branch, manual hooks). Future Evolution X builds will most likely keep it that way.
+>
+> - Just install the ROM update as it is and keep its own boot.img. Don't build or flash a custom kernel.
+> - After the reboot, KernelSU Next says **Working** and your modules are still there.
+> - If you run the workflow anyway, it notices the built-in KernelSU and stops right away with **"KernelSU is already built in"**.
+>
+> You only need this repository for ROM builds **without** built-in KernelSU: Evolution X 12.3 and older, or other ROMs (LineageOS, crDroid, ...). More in [ROMs with KernelSU built in](#roms-with-kernelsu-built-in).
+
 Build your own KernelSU Next kernel for the **Xiaomi Mi 11 (venus)**, from your ROM's own kernel source, on GitHub Actions. Then flash it safely with a test boot first.
 
 No prebuilt kernels here. You build the one that matches your phone.
@@ -25,7 +36,7 @@ So a kernel someone else built is only safe for their exact ROM build. That's wh
 
 | | |
 |---|---|
-| ROM | Evolution X 12.3, Android 17 |
+| ROM | Evolution X 12.3, Android 17 (12.4 and newer have KernelSU Next built in: nothing to build) |
 | Kernel | `5.4.302-qgki-g082d73c24f7a` |
 | KernelSU Next | `v3.4.0-legacy`, manager v3.4.0 |
 | Hook | `kprobes` works. `syscall_table` boots, but KernelSU isn't detected (this kernel uses CFI). |
@@ -98,7 +109,7 @@ Then find your ROM's kernel source. It's usually linked in the ROM's XDA thread 
 
 | ROM | `kernel_repo` | `kernel_branch` | Status |
 |---|---|---|---|
-| Evolution X (Android 17) | `Evolution-X-Devices/kernel_xiaomi_venus` | `cnb` | Tested |
+| Evolution X (Android 17) | `Evolution-X-Devices/kernel_xiaomi_venus` | `cnb` | Tested up to 12.3. 12.4 and newer: KernelSU built in, no build needed |
 | LineageOS 23.2 | `LineageOS/android_kernel_xiaomi_sm8350` | `lineage-23.2` | Untested |
 | crDroid (Android 17) | `crdroidandroid/android_kernel_xiaomi_sm8350` | `17.0` | Untested |
 
@@ -179,11 +190,21 @@ Only want to check everything and build the image, without rebooting? Add `-Prep
 
 An OTA installs a new stock boot.img, so you lose root. If `uname -r` changed, build again with the new version, get the new stock boot.img, and run the flash script again.
 
+### ROMs with KernelSU built in
+
+Some ROMs now compile KernelSU Next into their own kernel. Evolution X does since 12.4 (kernel commit `b49845e1d267` and later): its source has `drivers/kernelsu`, manual hooks in `fs/` and `CONFIG_KSU=y` in `lahaina-qgki_defconfig`. For those builds:
+
+- **Don't build or flash a kernel.** The ROM's own boot.img already gives you root, and your modules in `/data/adb` stay.
+- The workflow stops right after cloning with **"KernelSU is already built in"**. Adding a second KernelSU on top can't work anyway: the ROM's hooks call functions of exactly its own KernelSU version, so the link fails with errors like `undefined symbol: ksu_init_rc_hook` or `ksu_handle_newfstat_ret`.
+- Coming from a kernel built here: just install the update. After the reboot KernelSU Next should say **Working**. Keep a manager version that fits the kernel's KernelSU; if it says "Kernel update required", install the matching manager.
+
 ## Troubleshooting
 
 | What you see | What it means | What to do |
 |---|---|---|
 | Build stops: commit not in repo | Wrong kernel source for your ROM | Find your ROM's real kernel source and branch. |
+| Build stops: KernelSU is already built in | Your ROM's kernel has KernelSU Next itself | Nothing to build. Keep the ROM's own boot.img. |
+| Link error `undefined symbol: ksu_init_rc_hook` / `ksu_handle_newfstat_ret` | Older workflow on a ROM with built-in KernelSU | Update your fork; you don't need a custom kernel. |
 | Build stops: built kernel is X, your phone runs Y | Same source, but config or version string differ | Check `defconfig` and the branch. Do not flash. |
 | Test boot: black screen or no touch | Kernel doesn't match your vendor modules | Hold power ~15 s to get back. Nothing was flashed. Check kernel_version and source. |
 | Test boot works, KernelSU "Not integrated" | Hook doesn't work on this kernel | Use `hook_mode = kprobes`. |

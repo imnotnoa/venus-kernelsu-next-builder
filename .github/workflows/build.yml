@@ -116,6 +116,36 @@ jobs:
           fi
           git -C kernel log -1 --format='Building %H (%cd) %s'
 
+      - name: Check for KernelSU already in the ROM kernel
+        working-directory: kernel
+        env:
+          DEFCONFIGS: ${{ inputs.defconfig }}
+        run: |
+          # Since Evolution X 12.4 (November 2026) the venus kernel ships KernelSU Next
+          # itself: drivers/kernelsu, manual hooks in fs/ and CONFIG_KSU=y in the
+          # defconfig. Those hooks call functions of exactly that KernelSU version, so
+          # adding another one fails to link (undefined ksu_init_rc_hook, ...). It is
+          # also not needed: the ROM's own boot.img already has root.
+          read -r -a CONFIGS <<< "$DEFCONFIGS"
+          FOUND=()
+          [ -e drivers/kernelsu ] && FOUND+=("drivers/kernelsu")
+          for f in "${CONFIGS[@]}"; do
+            grep -qx 'CONFIG_KSU=y' "arch/arm64/configs/$f" 2>/dev/null && FOUND+=("CONFIG_KSU=y in $f")
+          done
+          if [ ${#FOUND[@]} -gt 0 ]; then
+            VERSION=$(grep -m1 -oE 'KSU_VERSION_OVERRIDE \?= [0-9]+' drivers/kernelsu/Kbuild 2>/dev/null | grep -oE '[0-9]+$' || true)
+            LIST=$(printf '%s, ' "${FOUND[@]}"); LIST=${LIST%, }
+            MSG="This kernel source already has KernelSU built in ($LIST${VERSION:+; version $VERSION}). You don't need a custom kernel: install the ROM update as it is, keep its own boot.img, and open the KernelSU Next app."
+            echo "::error title=KernelSU is already built in::$MSG"
+            {
+              echo "## KernelSU is already built in"
+              echo
+              echo "$MSG"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "No built-in KernelSU found; adding KernelSU Next ${{ inputs.ksu_ref }}."
+
       - name: Download AOSP clang
         run: |
           mkdir clang
